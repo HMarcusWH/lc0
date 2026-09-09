@@ -2051,7 +2051,13 @@ int SearchWorker::GetPrefetchBatchTarget() const {
   double total_weight = 0.0;
   double squared_weight = 0.0;
   int candidate_count = 0;
+  const auto& root_move_filter = search_->root_move_filter_;
   for (const auto& edge : root->Edges()) {
+    if (!root_move_filter.empty() &&
+        std::find(root_move_filter.begin(), root_move_filter.end(),
+                  edge.GetMove()) == root_move_filter.end()) {
+      continue;
+    }
     if (edge.GetP() <= 0.0f) continue;
     const double weight =
         static_cast<double>(edge.GetNStarted()) +
