@@ -535,6 +535,13 @@ const OptionId SearchParams::kMaxPrefetchBatchId{
     "When the engine cannot gather a large enough batch for immediate use, try "
     "to prefetch up to X positions which are likely to be useful soon, and put "
     "them into cache."};
+const OptionId SearchParams::kAdaptivePrefetchId{
+    {.long_flag = "adaptive-prefetch",
+     .uci_option = "AdaptivePrefetch",
+     .help_text =
+         "Dynamically reduce the prefetch ceiling as the root search becomes "
+         "less ambiguous. MaxPrefetch remains the hard upper bound.",
+     .visibility = OptionId::kProOnly}};
 const OptionId SearchParams::kSolidTreeThresholdId{
     "solid-tree-threshold", "SolidTreeThreshold",
     "Only nodes with at least this number of visits will be considered for "
@@ -636,6 +643,7 @@ void BaseSearchParams::Populate(OptionsParser* options) {
 void SearchParams::Populate(OptionsParser* options) {
   BaseSearchParams::Populate(options);
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
+  options->Add<BoolOption>(kAdaptivePrefetchId) = false;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
 }
 

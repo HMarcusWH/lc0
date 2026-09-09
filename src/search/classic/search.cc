@@ -2030,20 +2030,75 @@ void SearchWorker::CollectCollisions() {
 
 // 3. Prefetch into cache.
 // ~~~~~~~~~~~~~~~~~~~~~~~
+int SearchWorker::GetPrefetchBatchTarget() const {
+  const int max_prefetch = params_.GetMaxPrefetchBatch();
+  if (!params_.GetAdaptivePrefetch() || max_prefetch <= 1 ||
+      params_.GetMultiPv() > 1) {
+    return max_prefetch;
+  }
+
+  const Node* root = search_->root_node_;
+  if (!root || !root->HasChildren() ||
+      root->GetChildrenVisits() < static_cast<uint32_t>(max_prefetch)) {
+    // Keep the full speculative budget during search warm-up.
+    return max_prefetch;
+  }
+
+  // Treat visits as evidence and policy as a one-batch pseudocount. The
+  // inverse Herfindahl index estimates the effective number of live root
+  // candidates. As that decision frontier collapses, spend less speculative
+  // NN compute.
+  double total_weight = 0.0;
+  double squared_weight = 0.0;
+  int candidate_count = 0;
+  const auto& root_move_filter = search_->root_move_filter_;
+  for (const auto& edge : root->Edges()) {
+    if (!root_move_filter.empty() &&
+        std::find(root_move_filter.begin(), root_move_filter.end(),
+                  edge.GetMove()) == root_move_filter.end()) {
+      continue;
+    }
+    if (edge.GetP() <= 0.0f) continue;
+    const double weight =
+        static_cast<double>(edge.GetNStarted()) +
+        static_cast<double>(max_prefetch) * edge.GetP();
+    total_weight += weight;
+    squared_weight += weight * weight;
+    ++candidate_count;
+  }
+
+  const int min_prefetch = std::max(1, (max_prefetch + 2) / 3);
+  if (candidate_count <= 1 || squared_weight <= 0.0) return min_prefetch;
+
+  const double effective_candidates =
+      total_weight * total_weight / squared_weight;
+  const double uncertainty = std::clamp(
+      (effective_candidates - 1.0) / (candidate_count - 1.0), 0.0, 1.0);
+
+  // sqrt() keeps the controller deliberately generous while multiple root
+  // moves remain plausible.
+  const double effort = std::sqrt(uncertainty);
+  return std::clamp(
+      min_prefetch + static_cast<int>(
+                         std::lround((max_prefetch - min_prefetch) * effort)),
+      min_prefetch, max_prefetch);
+}
+
 void SearchWorker::MaybePrefetchIntoCache() {
   LCTRACE_FUNCTION_SCOPE;
   // TODO(mooskagh) Remove prefetch into cache if node collisions work well.
   // If there are requests to NN, but the batch is not full, try to prefetch
   // nodes which are likely useful in future.
   if (search_->stop_.load(std::memory_order_acquire)) return;
-  if (computation_->UsedBatchSize() > 0 &&
-      static_cast<int>(computation_->UsedBatchSize()) <
-          params_.GetMaxPrefetchBatch()) {
-    history_.Trim(search_->played_history_.GetLength());
-    SharedMutex::SharedLock lock(search_->nodes_mutex_);
-    PrefetchIntoCache(
-        search_->root_node_,
-        params_.GetMaxPrefetchBatch() - computation_->UsedBatchSize(), false);
+  const int used_batch = static_cast<int>(computation_->UsedBatchSize());
+  const int max_prefetch = params_.GetMaxPrefetchBatch();
+  if (used_batch == 0 || used_batch >= max_prefetch) return;
+
+  history_.Trim(search_->played_history_.GetLength());
+  SharedMutex::SharedLock lock(search_->nodes_mutex_);
+  const int prefetch_batch = GetPrefetchBatchTarget();
+  if (used_batch < prefetch_batch) {
+    PrefetchIntoCache(search_->root_node_, prefetch_batch - used_batch, false);
   }
 }
 
