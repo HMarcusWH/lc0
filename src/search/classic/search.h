@@ -29,10 +29,12 @@
 
 #include <array>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 
 #include "chess/callbacks.h"
 #include "chess/uciloop.h"
@@ -46,6 +48,31 @@
 
 namespace lczero {
 namespace classic {
+
+struct DefectTelemetryIteration {
+  int batch_before_prefetch = 0;
+  int batch_after_prefetch = 0;
+  int max_prefetch = 0;
+  int prefetch_target = 0;
+  int candidate_count = 0;
+  uint64_t root_children_visits = 0;
+  uint32_t leader_visits = 0;
+  uint32_t runner_up_visits = 0;
+  uint16_t leader_move_raw = 0;
+  uint16_t runner_up_move_raw = 0;
+  double effective_candidates = 0.0;
+  double uncertainty = 0.0;
+  double top1_policy_mass = 0.0;
+  double top2_policy_mass = 0.0;
+  double top4_policy_mass = 0.0;
+  double top1_visit_mass = 0.0;
+  double top2_visit_mass = 0.0;
+  double top4_visit_mass = 0.0;
+  uint64_t gather_us = 0;
+  uint64_t prefetch_us = 0;
+  uint64_t nn_us = 0;
+  uint64_t backup_us = 0;
+};
 
 class Search {
  public:
@@ -137,6 +164,39 @@ class Search {
   void CancelSharedCollisions();
 
   PositionHistory GetPositionHistoryAtNode(const Node* node) const;
+
+  void RecordDefectPrimaryRequest(uint64_t position_hash, bool cache_hit);
+  void RecordDefectSpeculativeProbe(bool cache_hit);
+  void RegisterDefectSpeculativeSubmissions(
+      const std::vector<uint64_t>& position_hashes);
+  void RecordDefectTelemetryIteration(const DefectTelemetryIteration& telemetry);
+  void EmitDefectTelemetry();
+
+  struct DefectTelemetryTotals {
+    uint64_t iterations = 0;
+    uint64_t primary_requests = 0;
+    uint64_t primary_cache_hits = 0;
+    uint64_t primary_submissions = 0;
+    uint64_t speculative_probes = 0;
+    uint64_t speculative_cache_hits = 0;
+    uint64_t speculative_submissions = 0;
+    uint64_t speculative_consumed = 0;
+    uint64_t batch_before_prefetch_sum = 0;
+    uint64_t batch_after_prefetch_sum = 0;
+    uint64_t prefetch_target_sum = 0;
+    uint64_t gather_us = 0;
+    uint64_t prefetch_us = 0;
+    uint64_t nn_us = 0;
+    uint64_t backup_us = 0;
+  };
+
+  mutable Mutex defect_telemetry_mutex_;
+  DefectTelemetryTotals defect_telemetry_totals_
+      GUARDED_BY(defect_telemetry_mutex_);
+  std::unordered_map<uint64_t, uint64_t> defect_speculative_outstanding_
+      GUARDED_BY(defect_telemetry_mutex_);
+  std::vector<std::string> defect_telemetry_iterations_
+      GUARDED_BY(defect_telemetry_mutex_);
 
   mutable Mutex counters_mutex_ ACQUIRED_AFTER(nodes_mutex_);
   // Tells all threads to stop.
@@ -399,7 +459,7 @@ class SearchWorker {
   };
 
   NodeToProcess PickNodeToExtend(int collision_limit);
-  int GetPrefetchBatchTarget() const;
+  int GetPrefetchBatchTarget();
   int PrefetchIntoCache(Node* node, int budget, bool is_odd_depth);
   void DoBackupUpdateSingleNode(const NodeToProcess& node_to_process);
   // Returns whether a node's bounds were set based on its children.
@@ -436,6 +496,8 @@ class SearchWorker {
   const bool moves_left_support_;
   IterationStats iteration_stats_;
   StoppersHints latest_time_manager_hints_;
+  DefectTelemetryIteration defect_telemetry_iteration_;
+  std::vector<uint64_t> defect_pending_speculative_hashes_;
 
   // Multigather task related fields.
 

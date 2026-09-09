@@ -1077,11 +1077,152 @@ void Search::CancelSharedCollisions() REQUIRES(nodes_mutex_) {
 Search::~Search() {
   Abort();
   Wait();
+  if (params_.GetDefectTelemetry()) EmitDefectTelemetry();
   {
     SharedMutex::Lock lock(nodes_mutex_);
     CancelSharedCollisions();
   }
   LOGFILE << "Search destroyed.";
+}
+
+void Search::RecordDefectPrimaryRequest(uint64_t position_hash,
+                                        bool cache_hit) {
+  if (!params_.GetDefectTelemetry()) return;
+  Mutex::Lock lock(defect_telemetry_mutex_);
+  ++defect_telemetry_totals_.primary_requests;
+  if (!cache_hit) {
+    ++defect_telemetry_totals_.primary_submissions;
+    return;
+  }
+
+  ++defect_telemetry_totals_.primary_cache_hits;
+  auto it = defect_speculative_outstanding_.find(position_hash);
+  if (it != defect_speculative_outstanding_.end() && it->second > 0) {
+    ++defect_telemetry_totals_.speculative_consumed;
+    if (--it->second == 0) defect_speculative_outstanding_.erase(it);
+  }
+}
+
+void Search::RecordDefectSpeculativeProbe(bool cache_hit) {
+  if (!params_.GetDefectTelemetry()) return;
+  Mutex::Lock lock(defect_telemetry_mutex_);
+  ++defect_telemetry_totals_.speculative_probes;
+  if (cache_hit) ++defect_telemetry_totals_.speculative_cache_hits;
+}
+
+void Search::RegisterDefectSpeculativeSubmissions(
+    const std::vector<uint64_t>& position_hashes) {
+  if (!params_.GetDefectTelemetry() || position_hashes.empty()) return;
+  Mutex::Lock lock(defect_telemetry_mutex_);
+  defect_telemetry_totals_.speculative_submissions += position_hashes.size();
+  for (const uint64_t hash : position_hashes) {
+    ++defect_speculative_outstanding_[hash];
+  }
+}
+
+void Search::RecordDefectTelemetryIteration(
+    const DefectTelemetryIteration& telemetry) {
+  if (!params_.GetDefectTelemetry()) return;
+  Mutex::Lock lock(defect_telemetry_mutex_);
+  auto& totals = defect_telemetry_totals_;
+  const uint64_t iteration = ++totals.iterations;
+  totals.batch_before_prefetch_sum += telemetry.batch_before_prefetch;
+  totals.batch_after_prefetch_sum += telemetry.batch_after_prefetch;
+  totals.prefetch_target_sum += telemetry.prefetch_target;
+  totals.gather_us += telemetry.gather_us;
+  totals.prefetch_us += telemetry.prefetch_us;
+  totals.nn_us += telemetry.nn_us;
+  totals.backup_us += telemetry.backup_us;
+
+  const int trace_limit = params_.GetDefectTelemetryIterations();
+  if (trace_limit <= 0 ||
+      defect_telemetry_iterations_.size() >= static_cast<size_t>(trace_limit)) {
+    return;
+  }
+
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(6)
+      << "{\"v\":1,\"iteration\":" << iteration
+      << ",\"batch_before\":" << telemetry.batch_before_prefetch
+      << ",\"batch_after\":" << telemetry.batch_after_prefetch
+      << ",\"max_prefetch\":" << telemetry.max_prefetch
+      << ",\"prefetch_target\":" << telemetry.prefetch_target
+      << ",\"root_children_visits\":" << telemetry.root_children_visits
+      << ",\"candidate_count\":" << telemetry.candidate_count
+      << ",\"effective_candidates\":"
+      << telemetry.effective_candidates
+      << ",\"uncertainty\":" << telemetry.uncertainty
+      << ",\"leader_move_raw\":" << telemetry.leader_move_raw
+      << ",\"leader_visits\":" << telemetry.leader_visits
+      << ",\"runner_up_move_raw\":" << telemetry.runner_up_move_raw
+      << ",\"runner_up_visits\":" << telemetry.runner_up_visits
+      << ",\"top1_policy_mass\":" << telemetry.top1_policy_mass
+      << ",\"top2_policy_mass\":" << telemetry.top2_policy_mass
+      << ",\"top4_policy_mass\":" << telemetry.top4_policy_mass
+      << ",\"top1_visit_mass\":" << telemetry.top1_visit_mass
+      << ",\"top2_visit_mass\":" << telemetry.top2_visit_mass
+      << ",\"top4_visit_mass\":" << telemetry.top4_visit_mass
+      << ",\"gather_us\":" << telemetry.gather_us
+      << ",\"prefetch_us\":" << telemetry.prefetch_us
+      << ",\"nn_us\":" << telemetry.nn_us
+      << ",\"backup_us\":" << telemetry.backup_us << "}";
+  defect_telemetry_iterations_.push_back(out.str());
+}
+
+void Search::EmitDefectTelemetry() {
+  DefectTelemetryTotals totals;
+  uint64_t speculative_unused = 0;
+  std::vector<std::string> iterations;
+  {
+    Mutex::Lock lock(defect_telemetry_mutex_);
+    totals = defect_telemetry_totals_;
+    for (const auto& [hash, count] : defect_speculative_outstanding_) {
+      (void)hash;
+      speculative_unused += count;
+    }
+    iterations = defect_telemetry_iterations_;
+  }
+
+  std::vector<ThinkingInfo> infos;
+  infos.reserve(iterations.size() + 1);
+  for (const auto& iteration : iterations) {
+    ThinkingInfo info;
+    info.comment = "DEFECT_TELEMETRY_ITER " + iteration;
+    infos.push_back(std::move(info));
+  }
+
+  const double denom = totals.iterations == 0 ? 1.0 : totals.iterations;
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(6)
+      << "{\"v\":1,\"iterations\":" << totals.iterations
+      << ",\"primary_requests\":" << totals.primary_requests
+      << ",\"primary_cache_hits\":" << totals.primary_cache_hits
+      << ",\"primary_submissions\":" << totals.primary_submissions
+      << ",\"speculative_probes\":" << totals.speculative_probes
+      << ",\"speculative_cache_hits\":"
+      << totals.speculative_cache_hits
+      << ",\"speculative_submissions\":"
+      << totals.speculative_submissions
+      << ",\"speculative_consumed\":" << totals.speculative_consumed
+      << ",\"speculative_unused\":" << speculative_unused
+      << ",\"avg_batch_before\":"
+      << totals.batch_before_prefetch_sum / denom
+      << ",\"avg_batch_after\":"
+      << totals.batch_after_prefetch_sum / denom
+      << ",\"avg_prefetch_target\":"
+      << totals.prefetch_target_sum / denom
+      << ",\"gather_us\":" << totals.gather_us
+      << ",\"prefetch_us\":" << totals.prefetch_us
+      << ",\"nn_us\":" << totals.nn_us
+      << ",\"backup_us\":" << totals.backup_us
+      << ",\"max_prefetch\":" << params_.GetMaxPrefetchBatch()
+      << ",\"adaptive_prefetch\":"
+      << (params_.GetAdaptivePrefetch() ? "true" : "false")
+      << ",\"trace_records\":" << iterations.size() << "}";
+  ThinkingInfo summary;
+  summary.comment = "DEFECT_TELEMETRY_SUMMARY " + out.str();
+  infos.push_back(std::move(summary));
+  uci_responder_->OutputThinkingInfo(&infos);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1201,8 +1342,20 @@ void SearchWorker::ExecuteOneIteration() {
     }
   }
 
+  const bool defect_telemetry = params_.GetDefectTelemetry();
+  auto phase_start = std::chrono::steady_clock::time_point{};
+
   // 2. Gather minibatch.
+  if (defect_telemetry) phase_start = std::chrono::steady_clock::now();
   GatherMinibatch();
+  if (defect_telemetry) {
+    defect_telemetry_iteration_.gather_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - phase_start)
+            .count();
+    defect_telemetry_iteration_.batch_before_prefetch =
+        static_cast<int>(computation_->UsedBatchSize());
+  }
   task_count_.store(-1, std::memory_order_release);
   search_->backend_waiting_counter_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1210,21 +1363,45 @@ void SearchWorker::ExecuteOneIteration() {
   CollectCollisions();
 
   // 3. Prefetch into cache.
+  if (defect_telemetry) phase_start = std::chrono::steady_clock::now();
   MaybePrefetchIntoCache();
+  if (defect_telemetry) {
+    defect_telemetry_iteration_.prefetch_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - phase_start)
+            .count();
+    defect_telemetry_iteration_.batch_after_prefetch =
+        static_cast<int>(computation_->UsedBatchSize());
+  }
 
   if (params_.GetMaxConcurrentSearchers() != 0) {
     search_->pending_searchers_.fetch_add(1, std::memory_order_acq_rel);
   }
 
   // 4. Run NN computation.
+  if (defect_telemetry) phase_start = std::chrono::steady_clock::now();
   RunNNComputation();
+  if (defect_telemetry) {
+    defect_telemetry_iteration_.nn_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - phase_start)
+            .count();
+  }
   search_->backend_waiting_counter_.fetch_add(-1, std::memory_order_relaxed);
 
   // 5. Retrieve NN computations (and terminal values) into nodes.
   FetchMinibatchResults();
 
   // 6. Propagate the new nodes' information to all their parents in the tree.
+  if (defect_telemetry) phase_start = std::chrono::steady_clock::now();
   DoBackupUpdate();
+  if (defect_telemetry) {
+    defect_telemetry_iteration_.backup_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - phase_start)
+            .count();
+    search_->RecordDefectTelemetryIteration(defect_telemetry_iteration_);
+  }
 
   // 7. Update the Search's status and progress information.
   UpdateCounters();
@@ -1260,6 +1437,13 @@ void SearchWorker::InitializeIteration() {
   computation_ = search_->backend_->CreateComputation();
   minibatch_.clear();
   minibatch_.reserve(2 * target_minibatch_size_);
+  if (params_.GetDefectTelemetry()) {
+    defect_telemetry_iteration_ = DefectTelemetryIteration{};
+    defect_telemetry_iteration_.max_prefetch = params_.GetMaxPrefetchBatch();
+    defect_telemetry_iteration_.prefetch_target =
+        params_.GetMaxPrefetchBatch();
+    defect_pending_speculative_hashes_.clear();
+  }
 }
 
 // 2. Gather minibatch.
@@ -1466,13 +1650,17 @@ void SearchWorker::ProcessPickedTask(int start_idx, int end_idx,
                        std::back_inserter(legal_moves),
                        [](const auto& edge) { return edge.GetMove(); });
         picked_node.eval->p.resize(legal_moves.size());
-        picked_node.is_cache_hit = computation_->AddInput(
-                                       EvalPosition{
-                                           .pos = history.GetPositions(),
-                                           .legal_moves = legal_moves,
-                                       },
-                                       picked_node.eval->AsPtr()) ==
-                                   BackendComputation::FETCHED_IMMEDIATELY;
+        const EvalPosition eval_position{
+            .pos = history.GetPositions(),
+            .legal_moves = legal_moves,
+        };
+        picked_node.is_cache_hit =
+            computation_->AddInput(eval_position, picked_node.eval->AsPtr()) ==
+            BackendComputation::FETCHED_IMMEDIATELY;
+        if (params_.GetDefectTelemetry()) {
+          search_->RecordDefectPrimaryRequest(
+              eval_position.pos.back().Hash(), picked_node.is_cache_hit);
+        }
       }
     }
     if (params_.GetOutOfOrderEval() && picked_node.CanEvalOutOfOrder()) {
@@ -2030,28 +2218,58 @@ void SearchWorker::CollectCollisions() {
 
 // 3. Prefetch into cache.
 // ~~~~~~~~~~~~~~~~~~~~~~~
-int SearchWorker::GetPrefetchBatchTarget() const {
+int SearchWorker::GetPrefetchBatchTarget() {
   const int max_prefetch = params_.GetMaxPrefetchBatch();
-  if (!params_.GetAdaptivePrefetch() || max_prefetch <= 1 ||
-      params_.GetMultiPv() > 1) {
+  const bool telemetry_enabled = params_.GetDefectTelemetry();
+  const bool adaptive_enabled = params_.GetAdaptivePrefetch() &&
+                                max_prefetch > 1 && params_.GetMultiPv() <= 1;
+  if (!adaptive_enabled && !telemetry_enabled) return max_prefetch;
+
+  const Node* root = search_->root_node_;
+  if (!root || !root->HasChildren()) {
+    if (telemetry_enabled) {
+      defect_telemetry_iteration_.max_prefetch = max_prefetch;
+      defect_telemetry_iteration_.prefetch_target = max_prefetch;
+    }
     return max_prefetch;
   }
 
-  const Node* root = search_->root_node_;
-  if (!root || !root->HasChildren() ||
-      root->GetChildrenVisits() < static_cast<uint32_t>(max_prefetch)) {
-    // Keep the full speculative budget during search warm-up.
+  const bool warmup =
+      root->GetChildrenVisits() < static_cast<uint32_t>(max_prefetch);
+  if (!telemetry_enabled && warmup) {
+    // Preserve the original adaptive-prefetch warm-up behavior exactly.
     return max_prefetch;
   }
 
   // Treat visits as evidence and policy as a one-batch pseudocount. The
   // inverse Herfindahl index estimates the effective number of live root
-  // candidates. As that decision frontier collapses, spend less speculative
-  // NN compute.
+  // candidates. Telemetry records the same state even when the adaptive
+  // controller is disabled, without changing the selected budget.
   double total_weight = 0.0;
   double squared_weight = 0.0;
+  double total_policy = 0.0;
+  double total_visits = 0.0;
+  std::array<double, 4> top_policy{};
+  std::array<double, 4> top_visits{};
+  uint32_t leader_visits = 0;
+  uint32_t runner_up_visits = 0;
+  uint16_t leader_move_raw = 0;
+  uint16_t runner_up_move_raw = 0;
   int candidate_count = 0;
   const auto& root_move_filter = search_->root_move_filter_;
+
+  auto insert_top4 = [](std::array<double, 4>* values, double value) {
+    for (size_t i = 0; i < values->size(); ++i) {
+      if (value > (*values)[i]) {
+        for (size_t j = values->size() - 1; j > i; --j) {
+          (*values)[j] = (*values)[j - 1];
+        }
+        (*values)[i] = value;
+        break;
+      }
+    }
+  };
+
   for (const auto& edge : root->Edges()) {
     if (!root_move_filter.empty() &&
         std::find(root_move_filter.begin(), root_move_filter.end(),
@@ -2059,29 +2277,84 @@ int SearchWorker::GetPrefetchBatchTarget() const {
       continue;
     }
     if (edge.GetP() <= 0.0f) continue;
-    const double weight =
-        static_cast<double>(edge.GetNStarted()) +
-        static_cast<double>(max_prefetch) * edge.GetP();
+
+    const uint32_t visits = edge.GetNStarted();
+    if (visits > leader_visits) {
+      runner_up_visits = leader_visits;
+      runner_up_move_raw = leader_move_raw;
+      leader_visits = visits;
+      leader_move_raw = edge.GetMove().raw_data();
+    } else if (visits > runner_up_visits) {
+      runner_up_visits = visits;
+      runner_up_move_raw = edge.GetMove().raw_data();
+    }
+
+    const double policy = edge.GetP();
+    const double weight = static_cast<double>(visits) +
+                          static_cast<double>(max_prefetch) * policy;
     total_weight += weight;
     squared_weight += weight * weight;
+    total_policy += policy;
+    total_visits += visits;
+    insert_top4(&top_policy, policy);
+    insert_top4(&top_visits, visits);
     ++candidate_count;
   }
 
   const int min_prefetch = std::max(1, (max_prefetch + 2) / 3);
-  if (candidate_count <= 1 || squared_weight <= 0.0) return min_prefetch;
+  double effective_candidates = candidate_count > 0 ? 1.0 : 0.0;
+  double uncertainty = 0.0;
+  if (candidate_count > 1 && squared_weight > 0.0) {
+    effective_candidates = total_weight * total_weight / squared_weight;
+    uncertainty = std::clamp(
+        (effective_candidates - 1.0) / (candidate_count - 1.0), 0.0, 1.0);
+  }
 
-  const double effective_candidates =
-      total_weight * total_weight / squared_weight;
-  const double uncertainty = std::clamp(
-      (effective_candidates - 1.0) / (candidate_count - 1.0), 0.0, 1.0);
+  int target = max_prefetch;
+  if (adaptive_enabled && !warmup) {
+    if (candidate_count <= 1 || squared_weight <= 0.0) {
+      target = min_prefetch;
+    } else {
+      // sqrt() keeps the controller deliberately generous while multiple root
+      // moves remain plausible.
+      const double effort = std::sqrt(uncertainty);
+      target = std::clamp(
+          min_prefetch +
+              static_cast<int>(std::lround(
+                  (max_prefetch - min_prefetch) * effort)),
+          min_prefetch, max_prefetch);
+    }
+  }
 
-  // sqrt() keeps the controller deliberately generous while multiple root
-  // moves remain plausible.
-  const double effort = std::sqrt(uncertainty);
-  return std::clamp(
-      min_prefetch + static_cast<int>(
-                         std::lround((max_prefetch - min_prefetch) * effort)),
-      min_prefetch, max_prefetch);
+  if (telemetry_enabled) {
+    auto& telemetry = defect_telemetry_iteration_;
+    telemetry.max_prefetch = max_prefetch;
+    telemetry.prefetch_target = target;
+    telemetry.root_children_visits = root->GetChildrenVisits();
+    telemetry.candidate_count = candidate_count;
+    telemetry.effective_candidates = effective_candidates;
+    telemetry.uncertainty = uncertainty;
+    telemetry.leader_visits = leader_visits;
+    telemetry.runner_up_visits = runner_up_visits;
+    telemetry.leader_move_raw = leader_move_raw;
+    telemetry.runner_up_move_raw = runner_up_move_raw;
+    if (total_policy > 0.0) {
+      telemetry.top1_policy_mass = top_policy[0] / total_policy;
+      telemetry.top2_policy_mass = (top_policy[0] + top_policy[1]) / total_policy;
+      telemetry.top4_policy_mass =
+          (top_policy[0] + top_policy[1] + top_policy[2] + top_policy[3]) /
+          total_policy;
+    }
+    if (total_visits > 0.0) {
+      telemetry.top1_visit_mass = top_visits[0] / total_visits;
+      telemetry.top2_visit_mass = (top_visits[0] + top_visits[1]) / total_visits;
+      telemetry.top4_visit_mass =
+          (top_visits[0] + top_visits[1] + top_visits[2] + top_visits[3]) /
+          total_visits;
+    }
+  }
+
+  return target;
 }
 
 void SearchWorker::MaybePrefetchIntoCache() {
@@ -2092,7 +2365,13 @@ void SearchWorker::MaybePrefetchIntoCache() {
   if (search_->stop_.load(std::memory_order_acquire)) return;
   const int used_batch = static_cast<int>(computation_->UsedBatchSize());
   const int max_prefetch = params_.GetMaxPrefetchBatch();
-  if (used_batch == 0 || used_batch >= max_prefetch) return;
+  if (used_batch == 0 || used_batch >= max_prefetch) {
+    if (params_.GetDefectTelemetry()) {
+      SharedMutex::SharedLock lock(search_->nodes_mutex_);
+      GetPrefetchBatchTarget();
+    }
+    return;
+  }
 
   history_.Trim(search_->played_history_.GetLength());
   SharedMutex::SharedLock lock(search_->nodes_mutex_);
@@ -2110,8 +2389,13 @@ int SearchWorker::PrefetchIntoCache(Node* node, int budget, bool is_odd_depth) {
 
   // We are in a leaf, which is not yet being processed.
   if (!node || node->GetNStarted() == 0) {
-    if (search_->backend_->GetCachedEvaluation(
-            EvalPosition{history_.GetPositions(), {}})) {
+    const EvalPosition probe_position{history_.GetPositions(), {}};
+    const bool cache_hit =
+        search_->backend_->GetCachedEvaluation(probe_position).has_value();
+    if (params_.GetDefectTelemetry()) {
+      search_->RecordDefectSpeculativeProbe(cache_hit);
+    }
+    if (cache_hit) {
       // Make it return 0 to make it not use the slot, so that the function
       // tries hard to find something to cache even among unpopular moves.
       // In practice that slows things down a lot though, as it's not always
@@ -2119,8 +2403,14 @@ int SearchWorker::PrefetchIntoCache(Node* node, int budget, bool is_odd_depth) {
       return 1;
     }
     auto moves = history_.Last().GetBoard().GenerateLegalMoves();
-    computation_->AddInput(EvalPosition{history_.GetPositions(), moves},
-                           EvalResultPtr{});
+    const EvalPosition eval_position{history_.GetPositions(), moves};
+    const auto add_result =
+        computation_->AddInput(eval_position, EvalResultPtr{});
+    if (params_.GetDefectTelemetry() &&
+        add_result == BackendComputation::ENQUEUED_FOR_EVAL) {
+      defect_pending_speculative_hashes_.push_back(
+          eval_position.pos.back().Hash());
+    }
     return 1;
   }
 
@@ -2198,6 +2488,14 @@ int SearchWorker::PrefetchIntoCache(Node* node, int budget, bool is_odd_depth) {
 // 4. Run NN computation.
 // ~~~~~~~~~~~~~~~~~~~~~~
 void SearchWorker::RunNNComputation() {
+  if (params_.GetDefectTelemetry() &&
+      !defect_pending_speculative_hashes_.empty()) {
+    // Register before ComputeBlocking() so another worker cannot observe a
+    // freshly cached speculative result before provenance is recorded.
+    search_->RegisterDefectSpeculativeSubmissions(
+        defect_pending_speculative_hashes_);
+    defect_pending_speculative_hashes_.clear();
+  }
   if (computation_->UsedBatchSize() > 0) computation_->ComputeBlocking();
 }
 
