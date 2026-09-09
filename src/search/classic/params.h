@@ -304,10 +304,14 @@ class SearchParams : public BaseSearchParams {
   int GetMaxPrefetchBatch() const {
     return options_.Get<int>(kMaxPrefetchBatchId);
   }
+  bool GetAdaptivePrefetch() const {
+    return options_.Get<bool>(kAdaptivePrefetchId);
+  }
   int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
+  static const OptionId kAdaptivePrefetchId;
   static const OptionId kSolidTreeThresholdId;
 
  private:
