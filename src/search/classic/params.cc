@@ -542,6 +542,20 @@ const OptionId SearchParams::kAdaptivePrefetchId{
          "Dynamically reduce the prefetch ceiling as the root search becomes "
          "less ambiguous. MaxPrefetch remains the hard upper bound.",
      .visibility = OptionId::kProOnly}};
+const OptionId SearchParams::kDefectTelemetryId{
+    {.long_flag = "defect-telemetry",
+     .uci_option = "DefectTelemetry",
+     .help_text =
+         "Emit read-only search/prefetch telemetry for defect-routing research. "
+         "Does not change search decisions.",
+     .visibility = OptionId::kProOnly}};
+const OptionId SearchParams::kDefectTelemetryIterationsId{
+    {.long_flag = "defect-telemetry-iterations",
+     .uci_option = "DefectTelemetryIterations",
+     .help_text =
+         "Maximum number of per-iteration defect telemetry snapshots retained "
+         "and emitted at search end (0 emits summary only).",
+     .visibility = OptionId::kProOnly}};
 const OptionId SearchParams::kSolidTreeThresholdId{
     "solid-tree-threshold", "SolidTreeThreshold",
     "Only nodes with at least this number of visits will be considered for "
@@ -644,6 +658,8 @@ void SearchParams::Populate(OptionsParser* options) {
   BaseSearchParams::Populate(options);
   options->Add<IntOption>(kMaxPrefetchBatchId, 0, 1024) = DEFAULT_MAX_PREFETCH;
   options->Add<BoolOption>(kAdaptivePrefetchId) = false;
+  options->Add<BoolOption>(kDefectTelemetryId) = false;
+  options->Add<IntOption>(kDefectTelemetryIterationsId, 0, 100000) = 0;
   options->Add<IntOption>(kSolidTreeThresholdId, 1, 2000000000) = 100;
 }
 
