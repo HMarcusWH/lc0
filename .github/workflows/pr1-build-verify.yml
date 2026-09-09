@@ -1,0 +1,27 @@
+name: PR1 build verification
+
+on:
+  push:
+    branches:
+      - experiment/adaptive-prefetch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: experiment/adaptive-prefetch
+          fetch-depth: 1
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build libabsl-dev zlib1g-dev
+      - name: Configure and build random-backend LC0
+        run: |
+          ./build.sh release -Dbuild_backends=false -Dgtest=false -Db_lto=false
+      - name: Smoke-test engine startup
+        run: |
+          test -x build/release/lc0
+          printf 'uci\nquit\n' | build/release/lc0 | tee /tmp/lc0-uci.txt
+          grep -q '^uciok$' /tmp/lc0-uci.txt
