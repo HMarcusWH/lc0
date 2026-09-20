@@ -307,11 +307,19 @@ class SearchParams : public BaseSearchParams {
   bool GetAdaptivePrefetch() const {
     return options_.Get<bool>(kAdaptivePrefetchId);
   }
+  bool GetDefectTelemetry() const {
+    return options_.Get<bool>(kDefectTelemetryId);
+  }
+  int GetDefectTelemetryIterations() const {
+    return options_.Get<int>(kDefectTelemetryIterationsId);
+  }
   int GetSolidTreeThreshold() const { return kSolidTreeThreshold; }
 
   // Search parameter IDs.
   static const OptionId kMaxPrefetchBatchId;
   static const OptionId kAdaptivePrefetchId;
+  static const OptionId kDefectTelemetryId;
+  static const OptionId kDefectTelemetryIterationsId;
   static const OptionId kSolidTreeThresholdId;
 
  private:
